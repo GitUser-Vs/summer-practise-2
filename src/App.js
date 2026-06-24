@@ -32,6 +32,7 @@ import React, { useEffect, useRef } from "react";
 // Размеры поля в пикселях
 const W = 700;
 const H = 700;
+const CELL = 60; // размер ячейки сетки в пикселях
 
 // Функция отрисовки
 function draw(ctx) {
@@ -41,6 +42,35 @@ function draw(ctx) {
   // заливка фона - тёмно-зелёный
   ctx.fillStyle = "#1a2e1a";
   ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = "rgba(255, 255, 0, 0.06)"; // (red, green, blue, alpha) - прозрачность 0.06
+  ctx.lineWidth   = 1;
+  for (let x = CELL; x < W; x += CELL) {
+    ctx.beginPath();   // начало пути
+    ctx.moveTo(x, 0);  // верхняя точка линии
+    ctx.lineTo(x, H);  // нижняя точка линии
+    ctx.stroke();
+  }
+
+  // Горизонтальные линии сетки 
+  for (let y = CELL; y < H; y += CELL) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+
+  // Подписи шкалы по X (каждые 120px) 
+  ctx.fillStyle = "rgba(255, 255, 0, 0.18)";
+  ctx.font      = "10px monospace";
+  for (let x = CELL * 2; x < W; x += CELL * 2) {
+    ctx.fillText(`${x}`, x + 2, 12); // текст чуть ниже верхнего края
+  }
+
+  // Подписи шкалы по Y 
+  for (let y = CELL * 2; y < H; y += CELL * 2) {
+    ctx.fillText(`${y}`, 3, y - 2);
+  }
 
   // рамка поля
   ctx.strokeStyle = "#3a5a3a";
