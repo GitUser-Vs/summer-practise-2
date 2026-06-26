@@ -36,6 +36,11 @@ const CELL = 50; // размер ячейки сетки в пикселях
 // Случайное число в [a, b)
 const rand = (a, b) => a + Math.random() * (b - a);
 
+const SPEED = {
+  herb: 55,  // px/с для травоядных
+  pred: 70,  // px/с для хищников
+};
+
 // Общие атрибуты животного
 function makeAnimal(kind) {
   return {
@@ -46,7 +51,7 @@ function makeAnimal(kind) {
   };
 }
 
-// ─── Инициализация популяции ───
+// Инициализация популяции
 function createPopulation() {
   return {
     herbivores: Array.from({ length: 6 }, () => makeAnimal("herb")), // 6 травоядных
@@ -54,13 +59,30 @@ function createPopulation() {
   };
 }
 
+// Шаг симуляции
+// dt — сколько реального времени прошло с прошлого кадра (в секундах).
+// Скорость задаётся в px/сек, поэтому смещение = speed * dt.
+// Т.е. если speed=60, dt=0.016, то смещение=0.96px за кадр при 60fps.
+function step(pop, dt) {
+  for (const e of [...pop.herbivores, ...pop.predators]) {
+    const speed = SPEED[e.kind];
+
+    // Формула движения
+    // cos(angle) — проекция на ось X
+    // sin(angle) — проекция на ось Y
+    e.x += Math.cos(e.angle) * speed * dt;
+    e.y += Math.sin(e.angle) * speed * dt;
+
+  }
+}
+
 // Отрисовка одного травоядного — зелёный круг
 function drawHerbivore(ctx, h) {
   ctx.beginPath();
   ctx.arc(h.x, h.y, 8, 0, Math.PI * 2); // круг радиуса 8px
-  ctx.fillStyle   = "#7ec87a";
+  ctx.fillStyle = "#7ec87a";
   ctx.strokeStyle = "#4a7a46";
-  ctx.lineWidth   = 1.5;
+  ctx.lineWidth = 1.5;
   ctx.fill();
   ctx.stroke();
 }
@@ -130,7 +152,7 @@ function draw(ctx, pop) {
 
   // рамка поля
   ctx.strokeStyle = "#3a5a3a";
-  ctx.lineWidth   = 2;
+  ctx.lineWidth = 2;
   ctx.strokeRect(1, 1, W - 2, H - 2);
 
   for (const h of pop.herbivores) drawHerbivore(ctx, h);
@@ -144,10 +166,20 @@ export default function Micro01() {
   // Животные создаются один раз и хранятся в ref
   const popRef = useRef(createPopulation());
 
+  const lastTs = useRef(null);
+
   useEffect(() => {
     let rafId;
 
-    function loop() {
+    function loop(ts) {
+
+      if (lastTs.current == null) lastTs.current = ts;
+      const dt = Math.min((ts - lastTs.current) / 1000, 0.05); // 50ms - скорость движения
+      lastTs.current = ts;
+
+      step(popRef.current, dt); // движение животных
+
+
       const ctx = canvasRef.current?.getContext("2d");
       if (ctx) draw(ctx, popRef.current); // отрисовка кадра
 
