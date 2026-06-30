@@ -29,6 +29,8 @@
 
 import React, { useEffect, useRef, useState } from "react";
 
+
+
 // Размеры поля в пикселях
 const W = 700, H = 700;
 const CELL = 50; // размер ячейки сетки в пикселях
@@ -42,12 +44,22 @@ const PRED_DETECT = 140; // Радиус обзора хищника
 const HERB_DETECT = 120; // Радиус обзора травоядного
 
 const CATCH_R  = 13;   // радиус досягаемости хищников
-const TURN_RATE = 6.5; // рад/сек — макс. скорость поворота
+const TURN_RATE = 6.5; // рад/сек - макс. скорость поворота
+
+const LOW_PRED=2;         // хищников «мало»
+const CRIT_HERB=3;        // травоядных «почти нет»
+const RESPAWN_DELAY=9;    // сек до появления мигрантов-хищников
+const STOP_PRED=5;        // при таком кол-ве хищников миграция травоядных прекращается
+const REGROW_INTERVAL=5;  // сек между появлениями одной особи травоядного
+
+const HERB={detectR:130,fleeBase:65,fleeBonus:60,wanderSpd:30,hungerRate:3.2,fatigueFlee:26,fatigueRest:16,starveTime:6,eatHungerDrop:22,reproRadius:32,reproThreshold:62,reproCooldown:13,max:18};
+const PRED={detectR:150,huntBase:48,huntBonus:72,wanderSpd:24,hungerRate:2.3,fatigueHunt:21,fatigueRest:13,starveTime:9,eatHungerDrop:62,reproRadius:36,reproThreshold:58,reproCooldown:21,max:10};
 
 // Случайное число в [a, b)
 const rand = (a, b) => a + Math.random() * (b - a);
 const dist  = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const sat  =  e=>clamp(100-e.hunger*0.8-e.fatigue*0.4,0,100);
 
 const SPEED = {
   herb: 55,  // px/с для травоядных
@@ -86,7 +98,7 @@ let _id = 1;
 function makeAnimal(kind) {
   return {
     id: _id++,
-    kind,                    // 'herb' — травоядное, 'pred' — хищник
+    kind,                    // 'herb' - травоядное, 'pred' - хищник
     x: rand(30, W - 30),    // случайная позиция X (на небольшом расстоянии от границы)
     y: rand(30, H - 30),    // случайная позиция Y
     angle: rand(-Math.PI, Math.PI), // направление взгляда объектов
@@ -113,8 +125,22 @@ function createPopulation() {
     predators:  Array.from({ length: 5 }, () => makeAnimal("pred")), // 5 хищников
     grass:      Array.from({ length: GRASS_N }, makeGrass),
     uiAccum: 0,
-    events:[],
+    log:[],
+    predRespawnTimer:0,   // накапливает время с момента падения < LOW_PRED
+    herbRecovering:false, // флаг режима восстановления травоядных
+    herbRegrowTimer:0,    // время до следующего появления особи
   };
+}
+
+// spawnNearBorder - вычисляет позицию у случайной стороны поля.
+// side 0 = верхний край, 1 = нижний, 2 = левый, 3 = правый.
+
+function spawnNearBorder(){
+  const side=Math.floor(rand(0,4)), m=rand(15,35);
+  if(side===0)return{x:rand(0,W),y:m};
+  if(side===1)return{x:rand(0,W),y:H-m};
+  if(side===2)return{x:m,y:rand(0,H)};
+  return{x:W-m,y:rand(0,H)};
 }
 
 // Трава медленно отрастает
@@ -143,7 +169,7 @@ function drawFatigueBar(ctx, e) { // усталость под полоской 
 }
 
 // Шаг симуляции
-// dt — сколько реального времени прошло с прошлого кадра (в секундах).
+// dt - сколько реального времени прошло с прошлого кадра (в секундах).
 // Скорость задаётся в px/сек, поэтому смещение = speed * dt.
 // Т.е. если speed=60, dt=0.016, то смещение=0.96px за кадр при 60fps.
 
@@ -193,7 +219,13 @@ function stepHerbivores(pop, dt) {
     }
 
     // Голодная смерть через 6 секунд при полной полоске голода
-    if (h.hunger >= 100) { h.starveT += dt; if (h.starveT > 6) h.alive = false; }
+    if (h.hunger >= 100) { 
+      h.starveT += dt; 
+      if (h.starveT > 6) {
+        h.alive = false; 
+        pop.log.push({kind:"death",text:`Травоядное №${h.id} погибло от голода`});
+      }
+    }
     else h.starveT = 0;
   }
   pop.herbivores = pop.herbivores.filter(h => h.alive);
@@ -231,13 +263,85 @@ function stepPredators(pop, dt) {
       advance(p,28,dt); p.fatigue=clamp(p.fatigue-13*dt,0,100);
     }
 
-    if(p.hunger>=100){p.starveT+=dt;if(p.starveT>9)p.alive=false;}else p.starveT=0;
+    if(p.hunger>=100){
+      p.starveT+=dt;
+      if(p.starveT>9) {
+        p.alive=false;
+        pop.log.push({kind:"death",text:`Хищник №${p.id} погиб от голода`});
+      }
+    }
+    else p.starveT=0;
   }
   pop.predators  = pop.predators.filter(p=>p.alive);
   pop.herbivores = pop.herbivores.filter(h=>h.alive);
 }
 
-// Отрисовка одного травоядного — зелёный круг
+function repro(pop,list,P,label){
+  if(list.length>=P.max)return;
+  for(let i=0;i<list.length;i++){
+    const a=list[i];
+    if(!a.alive||a.reproCD>0||sat(a)<P.reproThreshold)continue;
+    for(let j=i+1;j<list.length;j++){
+      const b=list[j];
+      if(!b.alive||b.reproCD>0||sat(b)<P.reproThreshold)continue;
+      if(dist(a,b)>P.reproRadius)continue;
+      const c=makeAnimal(a.kind);
+      c.x=(a.x+b.x)/2;
+      c.y=(a.y+b.y)/2;
+      c.hunger=15;
+      c.fatigue=0;
+      c.reproCD=P.reproCooldown;
+      list.push(c);a.reproCD=P.reproCooldown;
+      b.reproCD=P.reproCooldown;
+      pop.log.push({kind:"birth",text:`Родилось ${label} №${c.id}`});return;
+    }
+  }
+}
+
+// stepRespawns - механизмы восстановления популяции (мигрирование)
+// Вызывается после очистки массивов от умерших существ
+function stepRespawns(pop,dt){
+  // Механизм 1: хищники-мигранты у границы
+  if(pop.predators.length < LOW_PRED){
+    pop.predRespawnTimer += dt; // накапливаем время ожидания
+
+    if(pop.predRespawnTimer >= RESPAWN_DELAY){
+      const n = Math.random()<0.5 ? 1 : 2; // волна из 1 или 2 особей
+      for(let i=0;i<n;i++){
+        const pos = spawnNearBorder(); // позиция у края поля
+        const a   = makeAnimal("pred");
+        a.x=pos.x; a.y=pos.y;         // переопределяем позицию
+        pop.predators.push(a);
+      }
+      pop.log.push({kind:"spawn",text:`Мигранты у границы: +${n} хищн.`});
+      pop.predRespawnTimer=0; // сбрасываем - ждём снова
+    }
+  } else {
+    pop.predRespawnTimer=0; // хищников достаточно - сбрасываем без ожидания
+  }
+
+  // Механизм 2: постепенный приток травоядных
+  // Включение: оба условия одновременно
+  if(!pop.herbRecovering && pop.predators.length<=LOW_PRED && pop.herbivores.length<=CRIT_HERB){
+    pop.herbRecovering=true;
+    pop.herbRegrowTimer=0;
+  }
+  // Выключение: любое из условий
+  if(pop.herbRecovering && (pop.herbivores.length>=HERB.max || pop.predators.length>STOP_PRED)){
+    pop.herbRecovering=false;
+  }
+  // Приток - одна особь каждые несколько секунд
+  if(pop.herbRecovering && pop.herbivores.length<HERB.max){
+    pop.herbRegrowTimer+=dt;
+    if(pop.herbRegrowTimer>=REGROW_INTERVAL){
+      const a=makeAnimal("herb"); pop.herbivores.push(a);
+      pop.log.push({kind:"spawn",text:`Травоядное №${a.id} вернулось`});
+      pop.herbRegrowTimer=0;
+    }
+  }
+}
+
+// Отрисовка одного травоядного - зелёный круг
 function drawHerbivore(ctx, h) {
   ctx.beginPath();
   ctx.arc(h.x, h.y, 8, 0, Math.PI * 2); // круг радиуса 8px
@@ -246,11 +350,22 @@ function drawHerbivore(ctx, h) {
   ctx.lineWidth = 1.5;
   ctx.fill();
   ctx.stroke();
+
+  if(h.state === "fleeing") {
+    ctx.beginPath();
+    ctx.setLineDash([5,6]);
+    ctx.strokeStyle="rgba(126,200,122,0.22)";
+    ctx.lineWidth=1;
+    ctx.arc(h.x,h.y,HERB.detectR,0,Math.PI*2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
   drawHungerBar(ctx, h);
   drawFatigueBar(ctx,h);
 }
 
-// Отрисовка одного хищника — красный треугольник
+// Отрисовка одного хищника - красный треугольник
 function drawPredator(ctx, p) {
   ctx.save(); // сохранение текущей системы координат
 
@@ -261,7 +376,7 @@ function drawPredator(ctx, p) {
 
   // Отривсовка треугольника относительно нового центра
   ctx.beginPath();
-  ctx.moveTo( 12, 0);  // нос — по локальной оси X
+  ctx.moveTo( 12, 0);  // нос - по локальной оси X
   ctx.lineTo(-8, -7);  // левый задний угол
   ctx.lineTo(-8, 7);  // правый задний угол
   ctx.closePath();
@@ -272,12 +387,24 @@ function drawPredator(ctx, p) {
   ctx.fill();
   ctx.stroke();
   ctx.restore(); // возвращаем исходную систему координат
+
+  if(p.state === "hunting") {
+    ctx.beginPath();
+    ctx.setLineDash([5,6]);
+    ctx.strokeStyle = "rgba(224,80,50,0.22)";
+    ctx.lineWidth=1;
+    ctx.arc(p.x,p.y,PRED.detectR,0,Math.PI*2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+
   drawHungerBar(ctx, p);
   drawFatigueBar(ctx,p);
 }
 
 // Функция отрисовки
-function draw(ctx, pop, simTime = 0) {
+function draw(ctx, pop, popTime = 0) {
   // очистка всей страницы перед рисованием
   ctx.clearRect(0, 0, W, H);
 
@@ -321,7 +448,7 @@ function draw(ctx, pop, simTime = 0) {
 
   // Таймер симуляции
   ctx.fillStyle = "rgba(255,255,255,0.2)"; ctx.font = "11px monospace";
-  const timeValue = Number(simTime) || 0;
+  const timeValue = Number(popTime) || 0;
   ctx.fillText(`t = ${timeValue.toFixed(1)}s`, W - 80, H - 6);
 
   // Отображение травы с учётом времени и роста (прозрачность = growth)
@@ -345,10 +472,12 @@ export default function Micro01() {
 
   const lastTs = useRef(null);
 
-  const simTime   = useRef(0);
+  const popTime   = useRef(0);
   const uiAccum   = useRef(0);
 
-  const [counts, setCounts] = useState({ herb: 6, pred: 5 });
+  const [counts, setCounts] = useState({ herb: 6, pred: 5, predCD: null, herbR: false });
+
+  const [log,setLog]=useState([]);
 
   useEffect(() => {
     let rafId;
@@ -358,24 +487,37 @@ export default function Micro01() {
       if (lastTs.current == null) lastTs.current = ts;
       const dt = Math.min((ts - lastTs.current) / 1000, 0.05); // 50ms - скорость движения
       lastTs.current = ts;
-      simTime.current += dt;
-      uiAccum.current += dt;
+      popTime.current += dt;
+      
+      const sim=popRef.current;
 
       stepGrass(popRef.current,dt);
       stepHerbivores(popRef.current,dt);
       stepPredators(popRef.current,dt);
 
+      repro(sim,sim.herbivores,HERB,"травоядное");
+      repro(sim,sim.predators,PRED,"хищник");
+      sim.herbivores=sim.herbivores.filter(h=>h.alive);
+      sim.predators=sim.predators.filter(p=>p.alive);
+      stepRespawns(sim,dt); // ← ПОСЛЕДНЕЙ
+      if(sim.log.length>10)sim.log=sim.log.slice(-10);
+      uiAccum.current += dt;
+
       // Обновляем React-счётчик не каждый кадр, а раз в 0.5 секунды
       if (uiAccum.current >= 0.5) {
         uiAccum.current = 0;
+        const predCD = sim.predators.length < LOW_PRED?Math.max(0,RESPAWN_DELAY-sim.predRespawnTimer):null;
         setCounts({
-          herb: popRef.current.herbivores.length,
-          pred: popRef.current.predators.length,
+          herb: sim.herbivores.length,
+          pred: sim.predators.length,
+          predCD,
+		      herbR:sim.herbRecovering
         });
+        setLog([...sim.log].reverse());
       }
 
       const ctx = canvasRef.current?.getContext("2d");
-      if (ctx) draw(ctx, popRef.current, simTime.current); // отрисовка кадра
+      if (ctx) draw(ctx, sim, popTime.current); // отрисовка кадра
 
       rafId = requestAnimationFrame(loop); // повторный запуск
     }
@@ -388,16 +530,39 @@ export default function Micro01() {
 
   const reset = () => {
     popRef.current = createPopulation();
-    simTime.current = 0;
+    popTime.current = 0;
     lastTs.current = null;
   };
 
+  const dotColor={kill:"#e04428",birth:"#d8a657",death:"#555",spawn:"#5599aa"};
+
+
+  //<button onClick={reset} style={btn}>↺ Перезапустить</button>
   return (
     <div style={wrap}>
       <Tag>Симуляция Травоядные - Хищники</Tag>
       <h2 style={h2}>Пустое поле</h2>
       <canvas ref={canvasRef} width={W} height={H} style={canvas} />
-      <button onClick={reset} style={btn}>↺ Перезапустить</button>
+      
+      
+      
+      <div style={{display:"flex",gap:12,marginBottom:10,fontSize:13,flexWrap:"wrap",alignItems:"center"}}>
+        <span>Травоядных: <b style={{color:"#7ec87a"}}>{counts.herb}</b></span>
+        <span>Хищников: <b style={{color:"#e04428"}}>{counts.pred}</b></span>
+        {counts.predCD!==null&&<span style={badge("#e04428")}>⚠ Хищники через {Math.ceil(counts.predCD)}с</span>}
+        {counts.herbR&&<span style={badge("#7ec87a")}>⟳ Травоядные восстанавливаются</span>}
+        <button onClick={()=>{popRef.current=createPopulation();setLog([]);}} style={btn}>↺</button>
+      </div>
+      
+      <div style={{marginTop:8,fontSize:11,color:"#4a7050",maxHeight:80,overflowY:"auto",lineHeight:1.9}}>
+        {log.length===0&&<span>Событий пока нет…</span>}
+        {log.map((l,i)=>(
+          <div key={i} style={{display:"flex",gap:6,alignItems:"center"}}>
+            <span style={{width:6,height:6,borderRadius:"50%",background:dotColor[l.kind]||"#555",flexShrink:0,display:"inline-block"}}/>
+            {l.text}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -409,3 +574,4 @@ const canvas = { border: "1px solid #2a4028", borderRadius: 8, display: "block" 
 const tag    = { fontSize: 10, letterSpacing: "0.18em", textTransform: "uppercase", color: "#c8944a", marginBottom: 6, display: "block" };
 const Tag    = ({ children }) => <span style={tag}>{children}</span>;
 const btn    = { padding: "4px 10px", background: "#1e2c1a", border: "1px solid #3a4c34", borderRadius: 6, color: "#a8c4a0", cursor: "pointer", fontFamily: "monospace", fontSize: 12 };
+const badge=col=>({fontSize:11,padding:"2px 8px",borderRadius:10,background:col+"22",border:`1px solid ${col}55`,color:col});
