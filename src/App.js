@@ -27,12 +27,15 @@
 
 
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 
-
+import {
+  LineChart, Line, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+} from "recharts";
 
 // Размеры поля в пикселях
-const W = 700, H = 700;
+const W = 920, H = 919;
 const CELL = 50; // размер ячейки сетки в пикселях
 const MARGIN = 12;
 
@@ -40,8 +43,8 @@ const GRASS_N   = 45;
 const EAT_R     = 15; // радиус потребления травы
 
 // Радиусы обнаружения
-const PRED_DETECT = 140; // Радиус обзора хищника
-const HERB_DETECT = 120; // Радиус обзора травоядного
+// const PRED_DETECT = 140; // Радиус обзора хищника
+// const HERB_DETECT = 120; // Радиус обзора травоядного
 
 const CATCH_R  = 13;   // радиус досягаемости хищников
 const TURN_RATE = 6.5; // рад/сек - макс. скорость поворота
@@ -108,6 +111,7 @@ function makeAnimal(kind) {
     fatigue: rand(0, 8), // усталость
     alive: true,
     state: "wander",
+    reproCD: rand(0, 5),
   };
 }
 
@@ -118,17 +122,20 @@ const makeGrass = () => ({
 });
 
 // Инициализация популяции
-function createPopulation() {
+function createPopulation(nH = 6, nP = 5) {
   _id = 1;
   return {
-    herbivores: Array.from({ length: 6 }, () => makeAnimal("herb")), // 6 травоядных
-    predators:  Array.from({ length: 5 }, () => makeAnimal("pred")), // 5 хищников
+    herbivores: Array.from({ length: nH }, () => makeAnimal("herb")), // 6 травоядных
+    predators:  Array.from({ length: nP }, () => makeAnimal("pred")), // 5 хищников
     grass:      Array.from({ length: GRASS_N }, makeGrass),
     uiAccum: 0,
     log:[],
     predRespawnTimer:0,   // накапливает время с момента падения < LOW_PRED
     herbRecovering:false, // флаг режима восстановления травоядных
     herbRegrowTimer:0,    // время до следующего появления особи
+    time: 0,
+    chartAccum: 0,
+
   };
 }
 
@@ -144,9 +151,10 @@ function spawnNearBorder(){
 }
 
 // Трава медленно отрастает
-function stepGrass(pop, dt) {
+function stepGrass(pop, dt, params) {
+  const rate = params?.grassGrowth ?? 0.04;
   for (const g of pop.grass) {
-    g.growth = clamp(g.growth + 0.04 * dt, 0, 1);
+    g.growth = clamp(g.growth + rate * dt, 0, 1);
     // полное восстановление с 0 до 1 занимает 1/0.04 = 25 секунд
   }
 }
@@ -174,7 +182,8 @@ function drawFatigueBar(ctx, e) { // усталость под полоской 
 // Т.е. если speed=60, dt=0.016, то смещение=0.96px за кадр при 60fps.
 
 // Травоядные
-function stepHerbivores(pop, dt) {
+function stepHerbivores(pop, dt, params) {
+  const detectR = params?.herbDetect ?? 120;
   for (const h of pop.herbivores) {
     if (!h.alive) continue;
 
@@ -185,7 +194,11 @@ function stepHerbivores(pop, dt) {
     let nearPred=null, pd=Infinity;
     for (const p of pop.predators) {
       if (!p.alive) continue;
-      const d=dist(h,p); if(d<120&&d<pd){pd=d;nearPred=p;}
+      const d=dist(h,p);
+      if(d<detectR&&d<pd) {
+        pd=d;
+        nearPred=p;
+      }
     }
 
     if (nearPred) {
@@ -232,14 +245,20 @@ function stepHerbivores(pop, dt) {
 }
 
 // Шаг: хищники
-function stepPredators(pop, dt) {
+function stepPredators(pop, dt, params) {
+  const detectR = params?.predDetect ?? 150;
   for (const p of pop.predators) {
     if (!p.alive) continue;
     p.hunger = clamp(p.hunger + 2.3*dt, 0, 100);
 
     let target=null, td=Infinity;
     for (const h of pop.herbivores) {
-      if(!h.alive) continue; const d=dist(p,h); if(d<150&&d<td){td=d;target=h;}
+      if(!h.alive) continue;
+      const d=dist(p,h);
+      if(d<detectR&&d<td) {
+        td=d;
+        target=h;
+      }
     }
 
     if (target) {
@@ -403,6 +422,22 @@ function drawPredator(ctx, p) {
   drawFatigueBar(ctx,p);
 }
 
+
+// Один полный шаг (params — объект из paramsRef, меняется слайдерами)
+function simulateStep(pop,dt,params){
+  const eff=dt*params.speedMult; // ← множитель скорости применяется здесь
+  stepGrass(pop,eff,params);
+  stepHerbivores(pop,eff,params);
+  stepPredators(pop,eff,params);
+  repro(pop,pop.herbivores,HERB,"травоядное");
+  repro(pop,pop.predators,PRED,"хищник");
+  pop.herbivores=pop.herbivores.filter(h=>h.alive);
+  pop.predators=pop.predators.filter(p=>p.alive);
+  stepRespawns(pop,eff);
+  pop.time+=eff;
+  if(pop.log.length>10) pop.log=pop.log.slice(-10);
+}
+
 // Функция отрисовки
 function draw(ctx, pop, popTime = 0) {
   // очистка всей страницы перед рисованием
@@ -469,15 +504,30 @@ export default function Micro01() {
 
   // Животные создаются один раз и хранятся в ref
   const popRef = useRef(createPopulation());
-
+  const runRef   =useRef(true);   // true - для работы паузы
   const lastTs = useRef(null);
 
   const popTime   = useRef(0);
   const uiAccum   = useRef(0);
-
   const [counts, setCounts] = useState({ herb: 6, pred: 5, predCD: null, herbR: false });
-
   const [log,setLog]=useState([]);
+  const [running,  setRunning ] =useState(true);
+
+  const [startN,   setStartN  ] =useState({h:6,p:5});
+  const [sliders,  setSliders ] =useState({predDetect:150,herbDetect:130,grassGrowth:0.045,speedMult:1});
+  const [history,  setHistory ] =useState([{t:0,herb:6,pred:5}]);
+  const paramsRef=useRef({predDetect:150,herbDetect:130,grassGrowth:0.045,speedMult:1});
+
+  const slide=(key,val)=>{
+    paramsRef.current[key]=val;         
+    setSliders(s=>({...s,[key]:val})); 
+  };
+
+  const reset=useCallback(()=>{
+    popRef.current=createPopulation(startN.h,startN.p);
+    setHistory([{t:0,herb:startN.h,pred:startN.p}]);
+    setLog([]);
+  },[startN]);
 
   useEffect(() => {
     let rafId;
@@ -491,29 +541,48 @@ export default function Micro01() {
       
       const sim=popRef.current;
 
-      stepGrass(popRef.current,dt);
-      stepHerbivores(popRef.current,dt);
-      stepPredators(popRef.current,dt);
+      // stepGrass(popRef.current,dt);
+      // stepHerbivores(popRef.current,dt);
+      // stepPredators(popRef.current,dt);
 
-      repro(sim,sim.herbivores,HERB,"травоядное");
-      repro(sim,sim.predators,PRED,"хищник");
-      sim.herbivores=sim.herbivores.filter(h=>h.alive);
-      sim.predators=sim.predators.filter(p=>p.alive);
-      stepRespawns(sim,dt); // ← ПОСЛЕДНЕЙ
-      if(sim.log.length>10)sim.log=sim.log.slice(-10);
+      // repro(sim,sim.herbivores,HERB,"травоядное");
+      // repro(sim,sim.predators,PRED,"хищник");
+      // sim.herbivores=sim.herbivores.filter(h=>h.alive);
+      // sim.predators=sim.predators.filter(p=>p.alive);
+      // stepRespawns(sim,dt); // ← ПОСЛЕДНЕЙ
+      // if(sim.log.length>10)sim.log=sim.log.slice(-10);
+
+      if (runRef.current) {
+        simulateStep(sim, dt, paramsRef.current);
+      }
+
       uiAccum.current += dt;
 
       // Обновляем React-счётчик не каждый кадр, а раз в 0.5 секунды
       if (uiAccum.current >= 0.5) {
         uiAccum.current = 0;
         const predCD = sim.predators.length < LOW_PRED?Math.max(0,RESPAWN_DELAY-sim.predRespawnTimer):null;
+
+        const all=[...sim.herbivores,...sim.predators];
+        const avgSat=all.length?Math.round(all.reduce((a,e)=>a+sat(e),0)/all.length):0;
+
         setCounts({
           herb: sim.herbivores.length,
           pred: sim.predators.length,
           predCD,
-		      herbR:sim.herbRecovering
+		      herbR:sim.herbRecovering,
+          sat: avgSat,
         });
         setLog([...sim.log].reverse());
+      }
+
+      // Обновление графика раз в секунду
+      if(sim.chartAccum>=1){
+        sim.chartAccum=0;
+        setHistory(h=>{
+          const next=[...h,{t:Math.round(sim.time),herb:sim.herbivores.length,pred:sim.predators.length}];
+          return next.length>150?next.slice(-150):next; 
+        });
       }
 
       const ctx = canvasRef.current?.getContext("2d");
@@ -528,40 +597,97 @@ export default function Micro01() {
     return () => cancelAnimationFrame(rafId);
   }, []); // [] - эффект запускается только один раз
 
-  const reset = () => {
-    popRef.current = createPopulation();
-    popTime.current = 0;
-    lastTs.current = null;
-  };
-
   const dotColor={kill:"#e04428",birth:"#d8a657",death:"#555",spawn:"#5599aa"};
-
+  const toggle=()=>{runRef.current=!runRef.current;setRunning(runRef.current);};
 
   //<button onClick={reset} style={btn}>↺ Перезапустить</button>
-  return (
-    <div style={wrap}>
-      <Tag>Симуляция Травоядные - Хищники</Tag>
-      <h2 style={h2}>Пустое поле</h2>
-      <canvas ref={canvasRef} width={W} height={H} style={canvas} />
+  return(
+    <div style={{padding:20,background:"#0b100b",minHeight:"100%",fontFamily:"monospace",color:"#b0c8a8"}}>
+      <span style={{fontSize:10,letterSpacing:"0.18em",textTransform:"uppercase",color:"#c8944a",display:"block",marginBottom:6}}>Симуляция Травоядные - Хищники</span>
+      <h2 style={{fontFamily:"Georgia,serif",fontSize:22,margin:"0 0 4px",color:"#cce0c2"}}>График и управление</h2>
       
-      
-      
-      <div style={{display:"flex",gap:12,marginBottom:10,fontSize:13,flexWrap:"wrap",alignItems:"center"}}>
-        <span>Травоядных: <b style={{color:"#7ec87a"}}>{counts.herb}</b></span>
-        <span>Хищников: <b style={{color:"#e04428"}}>{counts.pred}</b></span>
-        {counts.predCD!==null&&<span style={badge("#e04428")}>⚠ Хищники через {Math.ceil(counts.predCD)}с</span>}
-        {counts.herbR&&<span style={badge("#7ec87a")}>⟳ Травоядные восстанавливаются</span>}
-        <button onClick={()=>{popRef.current=createPopulation();setLog([]);}} style={btn}>↺</button>
-      </div>
-      
-      <div style={{marginTop:8,fontSize:11,color:"#4a7050",maxHeight:80,overflowY:"auto",lineHeight:1.9}}>
-        {log.length===0&&<span>Событий пока нет…</span>}
-        {log.map((l,i)=>(
-          <div key={i} style={{display:"flex",gap:6,alignItems:"center"}}>
-            <span style={{width:6,height:6,borderRadius:"50%",background:dotColor[l.kind]||"#555",flexShrink:0,display:"inline-block"}}/>
-            {l.text}
+
+      <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:16,alignItems:"start"}}>
+
+        <div>
+          <canvas ref={canvasRef} width={W} height={H} style={{border:"1px solid #2a4028",borderRadius:8,display:"block"}}/>
+          <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap",alignItems:"center"}}>
+            <button onClick={toggle} style={Btn(true)}>{running?"⏸ Пауза":"▶ Старт"}</button>
+            <button onClick={reset}  style={Btn(false)}>↺ Сбросить</button>
+            <span style={{fontSize:12,color:"#5a7054"}}>
+              Травоядных: <b style={{color:"#7ec87a"}}>{counts.herb}</b> ·
+              Хищников: <b style={{color:"#e04428"}}>{counts.pred}</b> ·
+              Sat: <b style={{color:"#d8a657"}}>{counts.sat}%</b>
+            </span>
+            {counts.predCD!==null&&<span style={badge("#e04428")}>⚠ Мигрирование хищников через {Math.ceil(counts.predCD)}с</span>}
+            {counts.herbR&&<span style={badge("#7ec87a")}>⟳ Восстановление</span>}
           </div>
-        ))}
+
+          <div style={{marginTop:14,background:"#131e13",border:"1px solid #2a4028",borderRadius:8,padding:"10px 6px 6px"}}>
+            <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",color:"#4a6444",marginBottom:4,paddingLeft:8}}>
+              Динамика численности
+            </div>
+            <ResponsiveContainer width="100%" height={160}>
+              <LineChart data={history} margin={{top:4,right:8,left:-18,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)"/>
+                <XAxis dataKey="t" tick={{fontSize:9,fill:"#4a6444"}} tickFormatter={t=>`${t}с`}/>
+                <YAxis tick={{fontSize:9,fill:"#4a6444"}} allowDecimals={false}/>
+                <Tooltip contentStyle={{background:"#131e13",border:"1px solid #2a4028",fontSize:11}}
+                         labelFormatter={t=>`t = ${t}с`}/>
+                <Legend wrapperStyle={{fontSize:10}}/>
+
+                <Line type="monotone" dataKey="pred" name="Хищники"    stroke="#e04428" strokeWidth={2} dot={false} isAnimationActive={false}/>
+                <Line type="monotone" dataKey="herb" name="Травоядные" stroke="#7ec87a" strokeWidth={2} dot={false} isAnimationActive={false}/>
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        <div>
+          <div style={{background:"#131e13",border:"1px solid #2a4028",borderRadius:8,padding:14,marginBottom:12}}>
+            <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",color:"#4a6444",marginBottom:12}}>Параметры</div>
+            {[
+              ["predDetect",  "Радиус хищника, px",    60, 260, 1,    sliders.predDetect],
+              ["herbDetect",  "Радиус травоядного, px", 60, 260, 1,    sliders.herbDetect],
+              ["grassGrowth", "Рост травы",             0.01,0.15,0.01,sliders.grassGrowth],
+              ["speedMult",   "Скорость симуляции x",  0.25, 3, 0.25, sliders.speedMult],
+            ].map(([key,label,mn,mx,step,val])=>(
+              <div key={key} style={{marginBottom:12}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"#5a7054",marginBottom:4}}>
+                  <span>{label}</span>
+                  <span style={{color:"#d8a657"}}>{Number(val).toFixed(step<1?2:0)}</span>
+                </div>
+
+                <input type="range" min={mn} max={mx} step={step} value={val}
+                       onChange={e=>slide(key,Number(e.target.value))}
+                       style={{width:"100%",accentColor:"#d8a657"}}/>
+              </div>
+            ))}
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              {[["h","Трав. при сбросе"],["p","Хищн. при сбросе"]].map(([k,label])=>(
+                <div key={k} style={{flex:1}}>
+                  <div style={{fontSize:10,color:"#4a6044",marginBottom:3}}>{label}</div>
+                  <input type="number" min={5} max={7} value={startN[k]}
+                         onChange={e=>setStartN(s=>({...s,[k]:clamp(+e.target.value||5,5,7)}))}
+                         style={{width:"100%",background:"#1a2617",border:"1px solid #2a3825",color:"#b0c8a8",borderRadius:6,padding:"4px 6px",fontFamily:"monospace",fontSize:13}}/>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{background:"#131e13",border:"1px solid #2a4028",borderRadius:8,padding:14}}>
+            <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",color:"#4a6444",marginBottom:8}}>Журнал событий</div>
+            <div style={{fontSize:11,color:"#4a7050",maxHeight:220,overflowY:"auto",lineHeight:2}}>
+              {log.length===0&&<span>Событий пока нет…</span>}
+              {log.map((l,i)=>(
+                <div key={i} style={{display:"flex",gap:6,alignItems:"center"}}>
+                  <span style={{width:6,height:6,borderRadius:"50%",background:dotColor[l.kind]||"#555",flexShrink:0,display:"inline-block"}}/>
+                  {l.text}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -575,3 +701,4 @@ const tag    = { fontSize: 10, letterSpacing: "0.18em", textTransform: "uppercas
 const Tag    = ({ children }) => <span style={tag}>{children}</span>;
 const btn    = { padding: "4px 10px", background: "#1e2c1a", border: "1px solid #3a4c34", borderRadius: 6, color: "#a8c4a0", cursor: "pointer", fontFamily: "monospace", fontSize: 12 };
 const badge=col=>({fontSize:11,padding:"2px 8px",borderRadius:10,background:col+"22",border:`1px solid ${col}55`,color:col});
+const Btn=p=>({padding:"6px 14px",borderRadius:7,cursor:"pointer",fontFamily:"monospace",fontSize:12,fontWeight:600,border:"1px solid",background:p?"#c8944a":"#1a2617",color:p?"#1a1406":"#b0c8a8",borderColor:p?"#c8944a":"#2a4028"});
